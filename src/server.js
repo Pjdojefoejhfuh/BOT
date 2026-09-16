@@ -1,0 +1,270 @@
+import express from "express";
+import cors from "cors";
+import bodyParser from "body-parser";
+import cookieParser from "cookie-parser";
+import jwt from "jsonwebtoken";
+import path from "path";
+import { fileURLToPath } from "url";
+import * as db from "./db.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const app = express();
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || "siteobfusque-secret-change-me";
+
+app.use(cors());
+app.use(bodyParser.json({ limit: "50mb" }));
+app.use(cookieParser());
+app.use(express.static(path.join(__dirname, "..", "public")));
+
+// ============================================================
+// CUSTOM EMOJIS
+// ============================================================
+const EMOJI = {
+  yes: "<a:MCE_yes:1549726857090441296>",
+  no: "<a:No:1549726859661545492>",
+  loading: "<a:loading:1549726853424615424>",
+};
+
+// ============================================================
+// CLYDE PROTECTION
+// ============================================================
+let obfuscateFn = null;
+let vmCompileFn = null;
+let vmGenerateFn = null;
+
+try {
+  const clyde = await import("./clyde/dist/index.js");
+  obfuscateFn = clyde.obfuscate;
+
+  try {
+    const compiler = await import("./clyde/dist/vm/Compiler.js");
+    vmCompileFn = compiler.compile;
+  } catch (e) { console.warn("[WARN] VM Compiler:", e.message); }
+
+  try {
+    const vmGen = await import("./clyde/dist/vm/vm-gen.js");
+    vmGenerateFn = vmGen.generateVM;
+  } catch (e) { console.warn("[WARN] VM Generator:", e.message); }
+
+  console.log(`[OK] Clyde Protection loaded`);
+} catch (e) {
+  console.error("[ERROR] Clyde not loaded:", e.message);
+}
+
+// ============================================================
+// AUTH MIDDLEWARE
+// ============================================================
+function authRequired(req, res, next) {
+  const token = req.cookies?.token || req.headers.authorization?.replace("Bearer ", "");
+  if (!token) return res.status(401).json({ error: "Not authenticated" });
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = await db.getUserById(payload.id);
+    if (!req.user) return res.status(401).json({ error: "User not found" });
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+function adminRequired(req, res, next) {
+  if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  next();
+}
+
+// ============================================================
+// AUTH ROUTES
+// ============================================================
+app.post("/api/auth/register", async (req, res) => {
+  const { username, email, password } = req.body;
+  if (!username || !email || !password) return res.status(400).json({ error: "Missing fields" });
+  if (password.length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
+
+  const result = await db.createUser(username, email, password);
+  if (result.error) return res.status(400).json({ error: result.error });
+
+  const token = jwt.sign({ id: result.id }, JWT_SECRET, { expiresIn: "7d" });
+  res.cookie("token", token, { httpOnly: true, maxAge: 7 * 24 * 3600 * 1000 });
+
+  await db.logAction(result.id, "register", { username }, req.ip);
+
+  res.json({ user: { id: result.id, username: result.username, apiKey: result.apiKey }, token });
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "Missing fields" });
+
+  const result = await db.loginUser(username, password);
+  if (result.error) return res.status(400).json({ error: result.error });
+
+  const token = jwt.sign({ id: result.id }, JWT_SECRET, { expiresIn: "7d" });
+  res.cookie("token", token, { httpOnly: true, maxAge: 7 * 24 * 3600 * 1000 });
+
+  await db.logAction(result.id, "login", { username }, req.ip);
+
+  res.json({ user: result, token });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  res.clearCookie("token");
+  res.json({ ok: true });
+});
+
+app.get("/api/auth/me", authRequired, (req, res) => {
+  res.json({ user: req.user });
+});
+
+// ============================================================
+// OBFUSCATION API
+// ============================================================
+app.post("/api/obfuscate", async (req, res) => {
+  const { source, options, apiKey } = req.body;
+
+  // Auth via cookie OR API key
+  let user = null;
+  if (apiKey) {
+    const u = await db.getUserByApiKey(apiKey);
+    if (u) user = u;
+  } else {
+    const token = req.cookies?.token;
+    if (token) {
+      try { user = await db.getUserById(jwt.verify(token, JWT_SECRET).id); } catch {}
+    }
+  }
+
+  if (!source || typeof source !== "string") {
+    return res.status(400).json({ error: "Source missing" });
+  }
+
+  if (source.length > 500000) {
+    return res.status(400).json({ error: "Script too long (max 500 KB)" });
+  }
+
+  if (!obfuscateFn) {
+    return res.status(500).json({ error: "Obfuscator not loaded" });
+  }
+
+  try {
+    const opts = {
+      renameLocals: true,
+      preserveGlobals: true,
+      encodeStrings: options?.strings !== false,
+      scramble: options?.flow !== false,
+      oneLine: false,
+      vmType: options?.vm ? "stack" : "none",
+      vmLevel: options?.vmLevel || "maximum",
+    };
+
+    const { lex, parse, printChunk } = await import("./clyde/dist/index.js");
+    const { tokens } = lex(source);
+    const ast = parse(tokens);
+    const obfuscated = obfuscateFn(ast, opts);
+
+    let output;
+    if (opts.vmType !== "none" && vmCompileFn && vmGenerateFn) {
+      const bytecode = vmCompileFn(obfuscated);
+      output = vmGenerateFn(bytecode, { level: opts.vmLevel });
+    } else {
+      output = printChunk(obfuscated);
+    }
+
+    if (user) {
+      await db.recordObfuscation(user.id, req.body.filename || "input.lua", source.length, output.length, opts, true);
+      await db.logAction(user.id, "obfuscate", { size: source.length, outputSize: output.length }, req.ip);
+    }
+
+    res.json({ output, emoji: EMOJI });
+  } catch (e) {
+    console.error("[obfuscate error]", e);
+
+    if (user) {
+      await db.recordObfuscation(user.id, req.body.filename || "input.lua", source.length, 0, {}, false);
+      await db.logAction(user.id, "obfuscate_error", { error: e.message }, req.ip);
+    }
+
+    res.status(500).json({ error: e.message || "Internal error" });
+  }
+});
+
+// ============================================================
+// DASHBOARD ROUTES
+// ============================================================
+app.get("/api/dashboard/stats", authRequired, async (req, res) => {
+  const obfuscations = await db.getUserObfuscations(req.user.id, 100);
+  const totalIn = obfuscations.reduce((s, o) => s + o.input_size, 0);
+  const totalOut = obfuscations.reduce((s, o) => s + o.output_size, 0);
+
+  res.json({
+    total: obfuscations.length,
+    totalInputBytes: totalIn,
+    totalOutputBytes: totalOut,
+    recent: obfuscations.slice(0, 10),
+  });
+});
+
+app.get("/api/dashboard/logs", authRequired, async (req, res) => {
+  res.json({ logs: await db.getLogs(req.user.id, 100) });
+});
+
+app.get("/api/dashboard/obfuscations", authRequired, async (req, res) => {
+  res.json({ obfuscations: await db.getUserObfuscations(req.user.id, 50) });
+});
+
+// ============================================================
+// SETTINGS
+// ============================================================
+app.post("/api/settings", authRequired, async (req, res) => {
+  const { theme, default_vm, default_strings, default_flow, default_max, webhook_url } = req.body;
+
+  await db.updateUser(req.user.id, {
+    theme,
+    default_vm: default_vm ? 1 : 0,
+    default_strings: default_strings ? 1 : 0,
+    default_flow: default_flow ? 1 : 0,
+    default_max: default_max ? 1 : 0,
+    webhook_url,
+  });
+
+  await db.logAction(req.user.id, "settings_update", req.body, req.ip);
+  res.json({ ok: true, user: await db.getUserById(req.user.id) });
+});
+
+// ============================================================
+// ADMIN
+// ============================================================
+app.get("/api/admin/users", authRequired, adminRequired, async (req, res) => {
+  res.json({ users: await db.getAllUsers() });
+});
+
+app.get("/api/admin/logs", authRequired, adminRequired, async (req, res) => {
+  res.json({ logs: await db.getLogs(null, 500) });
+});
+
+// ============================================================
+// HEALTH
+// ============================================================
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    version: "3.0.0",
+    clydeLoaded: !!obfuscateFn,
+    vmAvailable: !!vmCompileFn && !!vmGenerateFn,
+    emojis: EMOJI,
+  });
+});
+
+// ============================================================
+// START
+// ============================================================
+app.listen(PORT, () => {
+  console.log("");
+  console.log("  ⚡ SiteObfusque v3.0.0");
+  console.log("  ─────────────────────────");
+  console.log(`  🌐 http://localhost:${PORT}`);
+  console.log(`  🧠 Clyde: ${obfuscateFn ? "✅" : "❌"}`);
+  console.log(`  🎯 VM: ${vmCompileFn ? "✅" : "❌"}`);
+  console.log("");
+});
